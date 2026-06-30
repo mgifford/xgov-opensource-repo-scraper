@@ -17,8 +17,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: actions/setup-node@v4.1.0
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-node@v6.4.0
         with:
           node-version-file: '.nvm'
           cache: 'npm'
@@ -33,14 +33,14 @@ jobs:
       matrix:
         chunk: [0, 1, 2, 3]
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: actions/setup-node@v4.1.0
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-node@v6.4.0
         with:
           node-version-file: '.nvm'
           cache: 'npm'
       - run: npm ci --omit=dev
       - name: Restore repo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: cache/
           key: repo-cache-chunk${{ matrix.chunk }}-${{ github.run_id }}
@@ -53,7 +53,7 @@ jobs:
           done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/upload-artifact@v4.4.3
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: chunk-${{ matrix.chunk }}
           path: chunk-${{ matrix.chunk }}.json
@@ -62,8 +62,8 @@ jobs:
     needs: scrape
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: actions/download-artifact@v4.1.8
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/download-artifact@v8.0.1
         with:
           pattern: chunk-*
           merge-multiple: true
@@ -77,7 +77,7 @@ jobs:
           console.log('Merged ' + chunks.length + ' chunks: ' + all.length + ' repos');
           "
       - run: tar -cf public.tar ./public
-      - uses: actions/upload-artifact@v4.4.3
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: public.tar
           path: public.tar
@@ -95,14 +95,14 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4.1.8
+      - uses: actions/download-artifact@v8.0.1
         with:
           name: public.tar
       - run: tar -xf public.tar
-      - uses: actions/configure-pages@v5.0.0
-      - uses: actions/upload-pages-artifact@v3.0.1
+      - uses: actions/configure-pages@v6.0.0
+      - uses: actions/upload-pages-artifact@v5.0.0
         with:
           path: public
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4.0.5
+        uses: actions/deploy-pages@v5.0.0

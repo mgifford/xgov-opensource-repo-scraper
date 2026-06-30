@@ -1,7 +1,17 @@
-import yaml from "js-yaml";
-import { writeFileSync, readFileSync, mkdirSync, existsSync, copyFileSync } from "fs";
+import { load as yamlLoad } from "js-yaml";
+import {
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  existsSync,
+  copyFileSync,
+  createWriteStream,
+  statSync,
+} from "fs";
 import { join } from "path";
-import { gzipSync } from "zlib";
+import { gzipSync, createGzip } from "zlib";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
 import { Command } from "commander";
 import { classifyRepo, emptyCounts, addCounts } from "./sbom-normalize.js";
 
@@ -15,14 +25,14 @@ const INTER_BATCH_DELAY_MS = 2000; // delay between batches
 const MAX_RETRIES = 5;
 
 async function getOrgs() {
-  const allDepartments = yaml.load(
+  const allDepartments = yamlLoad(
     await (
       await fetch(
         "https://raw.githubusercontent.com/chrisns/government.github.com/add-uk-public-sector-orgs-202602/_data/governments.yml"
       )
     ).text()
   );
-  const researchDepts = yaml.load(
+  const researchDepts = yamlLoad(
     await (
       await fetch(
         "https://raw.githubusercontent.com/github/government.github.com/gh-pages/_data/research.yml"
@@ -801,8 +811,9 @@ program
 
       const { repo, action, sbomUrl } = item;
       const key = `${repo.owner}/${repo.name}`;
-      let shouldDelay = false;
-      let shouldStop = false;
+      // Both branches below assign these unconditionally before they're read.
+      let shouldDelay;
+      let shouldStop;
 
       if (action === "poll") {
         const r = await doPoll(repo, key, sbomUrl);
@@ -890,6 +901,62 @@ program
 
 // ---------- publish-sboms command ----------
 
+// Serialise a consolidated CycloneDX document by STREAMING its components
+// straight into a gzip file, and leave a small stub at the uncompressed path.
+//
+// Two problems are solved here:
+//   1. The estate-wide SBOM (24k+ repos, every dependency annotated) serialises
+//      to well over V8's ~512MB MAX_STRING_LENGTH, so `JSON.stringify(wholeDoc)`
+//      throws `RangeError: Invalid string length`. We instead emit the fixed
+//      envelope, then one component at a time, through a stream — never holding
+//      the whole document as a single string.
+//   2. GitHub Pages caps a published site at 1GB. Two ~500MB *uncompressed*
+//      consolidated files would blow that, so the uncompressed `.json` path now
+//      serves a tiny stub redirecting consumers to the gzipped artifact, which
+//      is the only full copy actually published.
+//
+// `gzUrl` is the public URL the stub points consumers to. Returns the gzipped
+// byte size for logging (the uncompressed size is never realised).
+async function writeCycloneDxStream(basePath, metadata, components, gzUrl) {
+  const prefix =
+    '{"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"metadata":' +
+    JSON.stringify(metadata) +
+    ',"components":[';
+
+  function* serialise() {
+    yield prefix;
+    for (let i = 0; i < components.length; i++) {
+      // Each component is small enough to stringify individually; only the
+      // concatenation of all of them would blow the string-length ceiling.
+      yield (i === 0 ? "" : ",") + JSON.stringify(components[i]);
+    }
+    yield "]}";
+  }
+
+  const jsonPath = `${basePath}.json`;
+  const gzPath = `${basePath}.json.gz`;
+
+  // Stream the components straight through gzip to disk — the full uncompressed
+  // JSON is never materialised, in memory or on disk.
+  await pipeline(Readable.from(serialise()), createGzip(), createWriteStream(gzPath));
+
+  // Stub at the uncompressed path so existing `/sbom.json` links resolve to a
+  // clear, machine-readable pointer instead of 404ing or shipping ~500MB.
+  writeFileSync(
+    jsonPath,
+    JSON.stringify(
+      {
+        moved: "Consolidated SBOM is published gzipped to keep the GitHub Pages site under its 1GB limit.",
+        url: gzUrl,
+      },
+      null,
+      2
+    )
+  );
+
+  return { gzBytes: statSync(gzPath).size };
+}
+
 program
   .command("publish-sboms")
   .description(
@@ -967,12 +1034,14 @@ program
     // with no resolved version and dev/build/CI tooling are marked CycloneDX
     // `scope: "excluded"` with an auditable `xgov:scope-basis` property, while
     // version-pinned runtime dependencies stay `scope: "required"`.
-    //   * sbom.json          — full inventory, now scope/resolution annotated.
-    //   * sbom-runtime.json   — required-scope, version-pinned components only:
+    //   * sbom.json.gz        — full inventory, scope/resolution annotated.
+    //   * sbom-runtime.json.gz — required-scope, version-pinned components only:
     //                           the artifact to point a scanner at (no phantom
     //                           name-only hits, no build-tool noise).
     //   * sbom-quality.json   — per-repo + estate resolution/scope metrics so the
     //                           coverage gap is measurable, not hidden.
+    // The consolidated docs are published gzipped only (the uncompressed `.json`
+    // paths serve stubs) — see writeCycloneDxStream for why.
     const cdxComponents = [];
     const runtimeComponents = [];
     const qualityPerRepo = [];
@@ -1023,41 +1092,36 @@ program
       component: { type: "application", name, description },
       tools: [{ name: "xgov-opensource-repo-scraper" }],
     });
-    const cdxDoc = (metadata, components) => ({
-      bomFormat: "CycloneDX",
-      specVersion: "1.5",
-      version: 1,
-      metadata,
-      components,
-    });
-
-    const cdx = cdxDoc(
+    // Stream-serialise both consolidated SBOMs straight to gzip: the full
+    // inventory exceeds V8's ~512MB max string length, so a single
+    // JSON.stringify would throw `RangeError: Invalid string length`, and two
+    // uncompressed ~500MB files would exceed the GitHub Pages 1GB site limit.
+    // The `.json` path serves a stub pointing at the gzipped artifact (see
+    // writeCycloneDxStream).
+    const cdxSizes = await writeCycloneDxStream(
+      join(outputDir, "sbom"),
       cdxMeta(
         "uk-gov-open-source",
         "Consolidated SBOM for UK government open source repositories"
       ),
-      cdxComponents
+      cdxComponents,
+      "./sbom.json.gz"
     );
-    const cdxJson = JSON.stringify(cdx);
-    const cdxGz = gzipSync(cdxJson);
-    writeFileSync(join(outputDir, "sbom.json"), cdxJson);
-    writeFileSync(join(outputDir, "sbom.json.gz"), cdxGz);
     console.log(
-      `Published consolidated CycloneDX SBOM: ${cdxComponents.length} repos (${(cdxJson.length / 1024 / 1024).toFixed(1)}MB, ${(cdxGz.length / 1024 / 1024).toFixed(1)}MB gzipped)`
+      `Published consolidated CycloneDX SBOM: ${cdxComponents.length} repos (${(cdxSizes.gzBytes / 1024 / 1024).toFixed(1)}MB gzipped)`
     );
 
-    const runtimeCdx = cdxDoc(
+    const runtimeSizes = await writeCycloneDxStream(
+      join(outputDir, "sbom-runtime"),
       cdxMeta(
         "uk-gov-open-source-runtime",
         "Runtime-only (version-pinned, scope=required) consolidated SBOM for CVE scanning — excludes dev/build/CI tooling and version-unresolved packages"
       ),
-      runtimeComponents
+      runtimeComponents,
+      "./sbom-runtime.json.gz"
     );
-    const runtimeJson = JSON.stringify(runtimeCdx);
-    writeFileSync(join(outputDir, "sbom-runtime.json"), runtimeJson);
-    writeFileSync(join(outputDir, "sbom-runtime.json.gz"), gzipSync(runtimeJson));
     console.log(
-      `Published runtime-only SBOM: ${runtimeComponents.length} repos, ${qualityTotals.runtime} scannable components (excluded ${qualityTotals.excludedUnresolved} unresolved, ${qualityTotals.excludedDev} dev-tooling, ${qualityTotals.excludedCi} CI-action)`
+      `Published runtime-only SBOM: ${runtimeComponents.length} repos, ${qualityTotals.runtime} scannable components (${(runtimeSizes.gzBytes / 1024 / 1024).toFixed(1)}MB gzipped; excluded ${qualityTotals.excludedUnresolved} unresolved, ${qualityTotals.excludedDev} dev-tooling, ${qualityTotals.excludedCi} CI-action)`
     );
 
     const pct = (n) =>
